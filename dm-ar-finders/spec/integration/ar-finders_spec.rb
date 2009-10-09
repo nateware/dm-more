@@ -3,14 +3,25 @@ require 'spec_helper'
 if HAS_SQLITE3 || HAS_MYSQL || HAS_POSTGRES
   describe "DataMapper::Resource" do
     after do
-     DataMapper.repository(:default).adapter.execute('DELETE from green_smoothies');
+      DataMapper.repository(:default).adapter.execute('DELETE from green_smoothies');
+      DataMapper.repository(:default).adapter.execute('DELETE from customers');
     end
 
     before(:all) do
+      class ::Customer
+        property :id, Serial
+        property :first_name, String
+        property :last_name, String
+        property :hometown, String
+
+        auto_migrate!(:default)
+      end
       class ::GreenSmoothie
         include DataMapper::Resource
         property :id, Serial
         property :name, String
+        property :customer_id, Integer
+        belongs_to :customer
 
         auto_migrate!(:default)
       end
@@ -43,35 +54,61 @@ if HAS_SQLITE3 || HAS_MYSQL || HAS_POSTGRES
         end
       end
     end
+    
+    it "should load associations via find_or_create" do
+      DataMapper.repository(:default) do
+        customer = Customer.new(:first_name => 'Jerry', :last_name => 'Cantrell', :hometown => 'Seattle')
+        customer.save
+        GreenSmoothie.find_or_create({:first_name => 'Jerry', :last_name => 'Cantrell', :hometown => 'Seattle'}).id.should eql(customer.id)
+        customer2 = GreenSmoothie.find_or_create({:first_name => 'Layne', :last_name => 'Staley', :hometown => 'Seattle'})
+        customer2.id.should eql(2)
+
+        green_smoothie = GreenSmoothie.new(:name => 'Banana', :customer_id => customer.id)
+        green_smoothie.save
+        banana = GreenSmoothie.find_or_create({:name => 'Banana', :customer_id => customer.id})
+        banana.id.should eql(green_smoothie.id)
+        banana.customer.should == customer
+
+        strawberry = GreenSmoothie.find_or_create({:name => 'Strawberry', :customer_id => customer2.id})
+        strawberry.id.should eql(2)
+        strawberry.customer.should == customer2
+      end
+    end
+
+    
 
     ###
 
     describe '#find_by_sql' do
       before(:each) do
         DataMapper.repository(:default) do
-          @resource = GreenSmoothie.create({:name => 'Banana'})
+          @customer1 = Customer.create(:first_name => 'Jerry', :last_name => 'Cantrell', :hometown => 'Seattle')
+          @customer2 = Customer.create(:first_name => 'Layne', :last_name => 'Staley', :hometown => 'Seattle')
+
+          @banana = GreenSmoothie.create(:name => 'Banana', :customer_id => @customer1.id)
+          @blueberry =  GreenSmoothie.create(:name => 'Blueberry', :customer_id => @customer2.id)
         end
       end
 
       it 'should find the resource when given a string' do
         DataMapper.repository(:default) do
           found = GreenSmoothie.find_by_sql <<-SQL
-            SELECT id, name FROM green_smoothies LIMIT 1
+            SELECT id, name FROM green_smoothies WHERE id = 1
           SQL
 
           found.should_not be_empty
-          found.first.should == @resource
+          found.first.should == @banana
         end
       end
 
       it 'should find the resource when given an array containing SQL and bind values' do
         DataMapper.repository(:default) do
-          found = GreenSmoothie.find_by_sql [<<-SQL, @resource.id]
+          found = GreenSmoothie.find_by_sql [<<-SQL, @banana.id]
             SELECT id, name FROM green_smoothies WHERE id = ?
           SQL
 
           found.should_not be_empty
-          found.first.should == @resource
+          found.first.should == @banana
         end
       end
 
@@ -99,13 +136,13 @@ if HAS_SQLITE3 || HAS_MYSQL || HAS_POSTGRES
       end
 
       it 'should accept a Query instance' do
-        query = GreenSmoothie.find_by_sql([<<-SQL, @resource.id]).query
+        query = GreenSmoothie.find_by_sql([<<-SQL, @banana.id]).query
           SELECT id, name FROM green_smoothies WHERE id = ?
         SQL
 
         found = GreenSmoothie.find_by_sql(query)
         found.should_not be_empty
-        found.first.should == @resource
+        found.first.should == @banana
       end
 
       # Options.
@@ -233,6 +270,94 @@ if HAS_SQLITE3 || HAS_MYSQL || HAS_POSTGRES
           resource = found.first
           GreenSmoothie.properties.each { |property| property.should be_loaded(resource) }
         end
+
+        it 'should correctly map reordered properties from the query' do
+          DataMapper.repository(:default) do
+            found = GreenSmoothie.find_by_sql([<<-SQL, @banana.id], :properties => [:name, :id])
+              SELECT name, id FROM green_smoothies WHERE id = ?
+            SQL
+
+            found.should_not be_empty
+            found.first.id.should == @banana.id
+            found.first.should == @banana
+          end
+        end
+
+        it 'should correctly map joined properties from the query' do
+          DataMapper.repository(:default) do
+            found = GreenSmoothie.find_by_sql([%(
+              SELECT s.name, s.id, c.first_name, c.last_name
+                FROM green_smoothies s, customers c
+               WHERE id = ?
+                 AND s.customer_id = c.id
+            ), @banana.id],
+            :properties => [:name, :id, Customer.property[:first_name], Customer.propery[:last_name]])
+
+            found.should_not be_empty
+            smoothie = found.first
+            smoothie.id.should == @banana.id
+            smoothie.name.should == @banana.name
+            smoothie.first_name.should == @customer1.first_name
+            smoothie.last_name.should  == @customer1.last_name
+          end
+        end
+      end
+
+      # Dynamic column enumeration (eg, not dependent on properties/fields).
+
+      describe 'column enumeration without properties' do
+
+        it 'should enumerate columns from the query without needing properties' do
+          found = GreenSmoothie.find_by_sql [<<-SQL, @banana.id]
+            SELECT name, customer_id, id FROM green_smoothies WHERE id = ?
+          SQL
+
+          found.should_not be_empty
+          found.first.should == @banana
+          found.first.id.should == @banana.id
+          found.first.name.should == @banana.name
+          found.first.customer_id.should == @banana.customer_id
+        end
+
+        it 'should enumerate columns from a join query without needing properties' do
+          DataMapper.repository(:default) do
+            found = GreenSmoothie.find_by_sql <<-SQL
+              SELECT s.name, s.id, c.first_name, c.last_name
+                FROM green_smoothies s, customers c
+               WHERE s.customer_id = c.id
+            SQL
+
+            found.should_not be_empty
+
+            banana = found.first
+            banana.id.should == @banana.id
+            banana.name.should == @banana.name
+            banana.first_name.should == @customer1.first_name
+            banana.last_name.should  == @customer1.last_name
+
+            blueberry = found.last
+            blueberry.id.should == @blueberry.id
+            blueberry.name.should == @blueberry.name
+            blueberry.first_name.should == @customer2.first_name
+            blueberry.last_name.should  == @customer2.last_name
+          end
+        end
+
+        it 'should enumerate columns from a group by query without needing properties' do
+          DataMapper.repository(:default) do
+            found = GreenSmoothie.find_by_sql <<-SQL
+              SELECT hometown, count(id) AS num_people
+                FROM customers
+               GROUP BY hometown
+            SQL
+
+            found.length.should == 1
+            found.first.hometown.should == @customer1.hometown
+            found.first.num_people.should == 2
+          end
+        end
+
+
       end
     end # find_by_sql
 
